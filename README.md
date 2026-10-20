@@ -2,7 +2,7 @@
 
 通过 Route-SFT 与 GRPO + OPSD，让 Actor 自主识别不可靠的 reasoning、触发 `<RETHINK>` 并生成纠正动作；局部 hint 仅在训练时提供给 Teacher。
 
-本仓库是 **Qwen2.5-1.5B-Instruct** 的独立复现入口，沿用 3B 版本的冻结 SFT 样本、配比、损失、训练步数与评测协议，只更换 Actor/Teacher/reference 的 backbone 尺寸。**不是 Qwen3-1.7B**，没有新增 `enable_thinking` 模板开关。1.5B 实验尚未运行，不将 3B 成绩作为本版本成绩。
+本仓库是 **Qwen2.5-1.5B-Instruct** 的独立复现入口，沿用 3B 版本的冻结 SFT 样本、配比、损失及评测协议。当前部署为 **8×A100 80GB，基线/方法各四卡并行**；SFT **只训练到 step2000**，但保留旧 4000 步计划的前 2000 步学习率轨迹，接 OPSD 的起点不变。**不是 Qwen3-1.7B**，没有新增 `enable_thinking` 模板开关。1.5B 实验尚未运行，不将 3B 成绩作为本版本成绩。完整差异与验证边界见 [配方审核](docs/experiment_log.md)。
 
 | 实验线 | 初始化 | 后训练 | 启动入口 |
 | --- | --- | --- | --- |
@@ -43,7 +43,9 @@ Agent 可能基于错误的状态理解或计划继续执行动作，而轨迹�
 \mathcal{L}_{\mathrm{SFT}} = \mathcal{L}_{\mathrm{suffix\text{-}CE}} + 0.1\,\mathcal{L}_{\mathrm{marker\text{-}BCE}}.
 ```
 
-后缀 CE 使用 sample-mean；marker BCE 使用全词表中的 `<RETHINK>` 概率，不加 SFT reference KL。训练集为 **10,000 Good + 6,000 Bad**，全局 batch 8、每批 5:3，学习率为 2e-6，共 2 epochs / 4,000 steps。开发集为任务互斥的 128 Good + 128 Bad。
+后缀 CE 使用 sample-mean；marker BCE 使用全词表中的 `<RETHINK>` 概率，不加 SFT reference KL。训练集为 **10,000 Good + 6,000 Bad**，全局 batch 8、每批 5:3，学习率为 2e-6，运行 **1 epoch / 2,000 steps**。四卡各处理两条，micro batch 每卡仍为 1；5:3 是全局配比，不是每卡配比。开发集为任务互斥的 128 Good + 128 Bad。
+
+**停止步数与 scheduler horizon 分开：** `total_steps=2000`，`scheduler_total_steps=4000`，warmup 仍为 400 步。不能把 cosine 改成在 2000 步衰减到零，否则就不是旧 3B 的 step2000 配方。
 
 ### GRPO + OPSD
 
@@ -70,7 +72,7 @@ Student 始终看不到 hint。Teacher 使用当前 Actor 权重的无梯度视�
 
 ## 8. How to Reproduce
 
-当前参考配置为 Linux/CUDA、单张 80 GB GPU、22 个 CPU 核、至少 48 GiB 主机内存，完整流程保守建议预留 400 GiB 磁盘（包含两条实验线与 SFT 断点）。硬件要求沿用 3B 配置，不声称已测试 1.5B 的最小显存。冻结 SFT 数据已包含在 [data/frozen_data.zip](data/frozen_data.zip)，无需另找作者索取；还需下载公开基模与 ALFWorld 资源，并配置自己的 hint API。要求见 [data/README.md](data/README.md)。权重、API 密钥、服务器信息和运行日志不进入 Git。程序不依赖作者电脑、外接硬盘或私有服务器。
+当前部署配置为 Linux/CUDA、**8×A100 80GB**，基线和方法各四卡。并行运行建议至少 44 个可用逻辑 CPU、192 GiB 主机内存（256 GiB 更宽裕），预留 400 GiB 可用磁盘；这是保守部署预算，不是实测最小需求。SFT 在四卡 DDP 上全参训练，OPSD 使用 SDAR 原生四卡 FSDP/rollout，TP=1。冻结 SFT 数据已包含在 [data/frozen_data.zip](data/frozen_data.zip)，无需另找作者索取；还需下载公开基模与 ALFWorld 资源，并配置自己的 hint API。要求见 [data/README.md](data/README.md)。权重、API 密钥、服务器信息和运行日志不进入 Git。程序不依赖作者电脑、外接硬盘或私有服务器。
 
 <details>
 <summary>环境与数据准备</summary>
@@ -94,19 +96,21 @@ python3.12 -m venv .venv-opsd
 .venv-opsd/bin/pip check
 
 cp .env.example .env
-# 删除 .env 中未使用的 HF_TOKEN / WANDB_API_KEY 示例值，或换成自己的值。
+# 编辑自己的 GPU 分组、ALFWorld 路径及 hint API；不要提交填好的 .env。
 .venv-sft/bin/python src/tools/setup.py --bundled-data
 .venv-sft/bin/python src/tools/setup.py --download-base --accept-model-license
 ```
 
 基模固定为官方 `Qwen/Qwen2.5-1.5B-Instruct` 的 `989aa7980e4cf806f80c7fef2b1adb7bc71aa306` 版本；不会自动替换成其他模型。数据文件的 SHA-256、样本顺序和任务拆分与 3B 版本完全相同，分别由 `configs/data.json`、`configs/data_bundle.json` 以及包内 manifest 验证。
 
-在 `.env` 末尾补充以下运行设置；相对路径以仓库根目录为准，GPU 编号使用自己获配的卡。请勿提交填好的 `.env`：
+按 `.env.example` 修改以下运行设置；相对路径以仓库根目录为准，GPU 编号使用自己获配的卡。请勿提交填好的 `.env`：
 
 ```bash
 SFT_PYTHON=./.venv-sft/bin/python
 OPSD_PYTHON=./.venv-opsd/bin/python
-CUDA_VISIBLE_DEVICES=0
+BASELINE_GPUS=0,1,2,3
+METHOD_GPUS=4,5,6,7
+RAY_ADDRESS=local
 ALFWORLD_DATA=/path/to/alfworld
 RETHINK_API_ENDPOINT=https://your-provider.example/v1/chat/completions
 RETHINK_API_KEY=your_own_api_key
@@ -115,7 +119,16 @@ RETHINK_API_CONCURRENCY=4
 
 提示 API 须支持 `glm-5.3-flash`、JSON 输出与 `reasoning_effort=low`，使用者自行提供账号；不需要作者的套餐或账户。模型与请求格式固定在 `src/opsd/sdar.patch`，不自动切换模型或供应商。请求包含触发轨迹，使用者应确认其数据允许发给所选供应商。API 没有自动费用上限；`--allow-api-cost` 是明确启动授权，不是预算控制。
 
-ALFWorld 资源可通过 OPSD 环境的 `alfworld-download` 工具准备（先设置 `ALFWORLD_DATA`），需包含完整的 `json_2.1.1` 与 `logic`。固定评测任务与种子见 [configs/seen140_tasks.json](configs/seen140_tasks.json)，资源版本不匹配会停止，而不会换一组任务运行。`.env.example` 中的 `DATA_ROOT` / `CHECKPOINT_ROOT` 保留模板字段；此冻结配方的实际路径由 `configs/sft.json` 和启动脚本决定，不支持仅修改这两个变量来重定位。
+ALFWorld 资源通过 OPSD 环境的 `alfworld-download` 工具准备，需包含完整的 `json_2.1.1` 与 `logic`：
+
+```bash
+set -a
+source .env
+set +a
+.venv-opsd/bin/alfworld-download
+```
+
+固定评测任务与种子见 [configs/seen140_tasks.json](configs/seen140_tasks.json)，资源版本不匹配会停止，而不会换一组任务运行。训练输出路径由 `configs/sft.json` 和启动脚本决定。
 
 </details>
 
@@ -123,24 +136,26 @@ ALFWorld 资源可通过 OPSD 环境的 `alfworld-download` 工具准备（先�
 
 ```bash
 bash scripts/reproduce.sh --check
-python -m unittest discover -s src/tools -p 'test_*.py'
+.venv-sft/bin/python -m unittest discover -s src/tools -p 'test_*.py'
+PYTHONPATH=src/sft .venv-sft/bin/python -m pytest src/sft/tests -q
+.venv-sft/bin/python src/tools/audit_recipe.py --framework
 bash scripts/reproduce.sh --run --allow-api-cost
 ```
 
-完整流程依次执行 SFT、方法 OPSD、基线及最终 seen140 评测，会使用 GPU 并调用 hint API。完成后根据本次评测自动更新 `results/tables/seen140.csv` 与 `results/figures/seen140.png`，不使用预填成绩。OPSD 起点固定为 SFT step2000，不使用 step4000。也可分别运行：
+完整流程在 **0–3 号卡运行基线**，同时在 **4–7 号卡依次运行 SFT 显存预检 → SFT2000 → 方法 OPSD**；卡号可在 `.env` 调整，组内四卡且两组不能重叠。两条线各自完成后导出 update150 并进行 seen140 最终评测，结果齐全后自动生成 `results/tables/seen140.csv` 与 `results/figures/seen140.png`。没有预填成绩，也不再训练 SFT2001–4000。也可分别运行：
 
 ```bash
 bash scripts/train.sh sft
 bash scripts/train.sh opsd --allow-api-cost
 bash scripts/train.sh baseline
-bash scripts/eval.sh --model /path/to/exported-hf-model --out runs/seen140 --step 150
+EVAL_GPU=0 bash scripts/eval.sh --model /path/to/exported-hf-model --out runs/seen140 --step 150
 ```
 
-**只跑基线**：准备 OPSD 环境、公开基模和 ALFWorld 游戏资源后，直接执行 `bash scripts/train.sh baseline`，不需要先跑 SFT，也不需要 hint API 账号或 `--allow-api-cost`。不要执行 `reproduce.sh --run`，后者会顺序运行两条完整实验线。单独评测使用导出的 Hugging Face 模型目录，固定任务集无需作者的外部文件。
+**只跑基线**：准备 OPSD 环境、公开基模和 ALFWorld 游戏资源后，直接执行 `bash scripts/train.sh baseline`，使用 `BASELINE_GPUS` 四卡，不需要先跑 SFT，也不需要 hint API 账号或 `--allow-api-cost`。不要执行 `reproduce.sh --run`，后者会同时运行两条完整实验线。单独评测使用导出的 Hugging Face 模型目录，固定任务集无需作者的外部文件。
 
-SFT 每 100 步记录 dev loss，每 500 步保存权重，第 2000/4000 步保存可续训状态。OPSD 每 10 步验证、每 20 步保存，保留最近两份完整断点。
+SFT 每 100 步记录 dev loss，每 500 步保存权重，500/1000/1500/2000 共四份；第 2000 步保存完整 optimizer/scheduler、四个 rank 的 RNG 和采样位置。OPSD 每 10 步验证、每 20 步保存，保留最近两份完整断点并保存最终 update150。
 
-SFT 默认保留所有已保存权重，不会向作者电脑传输或自动删除它们；磁盘不足时等待用户释放空间。完整流程要求 SFT/OPSD 各进程依次退出，不能同时占用同一张卡。首次安装与 GPU 运行前请执行 `python src/tools/check.py --assets`（需在 shell 中导入 `.env`），并用相应环境执行 `python src/tools/check.py --runtime sft` / `--runtime opsd`。CPU 检查不替代实际 CUDA 环境的训练验证。
+SFT 默认保留所有已保存权重，不会向作者电脑传输或自动删除它们；空间不足时保留已有断点、报告错误，不能盲目删文件。方法的 SFT/OPSD 必须前一阶段成功退出再接下一阶段；基线可独立并行。首次安装与 GPU 运行前执行 `.venv-sft/bin/python src/tools/check.py --assets`（需在 shell 中导入 `.env`），以及 `.venv-sft/bin/python src/tools/check.py --runtime sft` 和 `.venv-opsd/bin/python src/tools/check.py --runtime opsd`。CPU 检查不替代 CUDA/NCCL/vLLM 的实机检查。
 
 Ray 临时 socket/log 目录使用系统临时目录，位置记录在本次运行的 `runtime_paths.json`；可用 `RETHINK_RUNTIME_ROOT` 指定自己有权限的短路径。训练断点仍保存在 `checkpoints/`。发布时执行 `python src/tools/package.py --out /path/to/new-source.zip`，只打包白名单源码、公开文档与冻结数据包，不要直接压缩整个工作目录；隐私检查同时扫描压缩包内的文本。
 
@@ -150,89 +165,78 @@ Ray 临时 socket/log 目录使用系统临时目录，位置记录在本次运�
 
 ## 9. 8×A100 80GB 服务器：基线与方法独立运行
 
-**现有入口是单卡配方，不是八卡 DDP。** 在八卡服务器上，分配八张空闲 A100 80GB：四张跑基线，另四张依次跑 Route-SFT 与方法 OPSD。也不要因卡多而改变全局 batch、采样量、loss 归一化或更新数。SFT 当前资源检查要求单卡总显存至少 70 GiB、空闲至少 65 GiB；本节不适用于 A100 40GB。
+**一个 clone 即可运行两条线，共用只读基模、数据和依赖，但不共用训练状态。** 分配八张空闲 A100 80GB：四张跑基线，另四张依次跑 Route-SFT 与方法 OPSD。不要在另一 clone 再启动同样的一对任务。现有启动入口已实现四卡，不再需要运行者自行改分布式代码。SFT 要求每卡总显存至少 70 GiB、空闲至少 65 GiB；本配置不适用于 A100 40GB。
 
-### 两个独立工作目录
+| GPU 分组 | 阶段 | 输出 |
+| --- | --- | --- |
+| `BASELINE_GPUS=0,1,2,3` | 基模 → GRPO+OPSD150 | `checkpoints/baseline/` |
+| `METHOD_GPUS=4,5,6,7` | SFT2000 → GRPO+OPSD150＋局部 hint | `checkpoints/route_sft/`、`checkpoints/opsd/` |
 
-在自己有权限的服务器目录中准备两个 clone，并锁定同一 commit：
+SFT 由指定 SFT Python 的 `torch.distributed.run` 启动四个进程，使用独立随机端口；不要在外层再套一次 torchrun。OPSD 由 Ray 调度四个 FSDP/rollout worker，每条线强制独立 `address=local` 集群及临时目录，不连接另一条线的集群。不要对整台服务器执行 `ray stop`。
 
-```bash
-git clone https://github.com/leiye302/rethink-alfworld-qwen25-1.5b.git baseline
-COMMIT=$(git -C baseline rev-parse HEAD)
-git clone https://github.com/leiye302/rethink-alfworld-qwen25-1.5b.git method
-git -C method checkout --detach "$COMMIT"
-git -C baseline checkout --detach "$COMMIT"
-```
-
-两个目录分别完成第 8 节的环境、公开模型与 ALFWorld 资源准备，以及 `bash scripts/reproduce.sh --check`。冻结 SFT 数据已经随仓库上传，方法端执行 `setup.py --bundled-data` 即可校验解包，不需要作者电脑或任何旧服务器。ALFWorld 游戏资源可共用一份只读目录，训练输出、断点、日志和 API 缓存不得共用。
-
-分别编辑各自的 `.env`：基线设置 `CUDA_VISIBLE_DEVICES=0`，方法设置 `CUDA_VISIBLE_DEVICES=1`，编号以实际获配的空闲卡为准。**启动脚本会读取 `.env`；不要只在命令前改 GPU 环境变量而漏改 `.env`。** 两个目录均补充：
+在调度器或 `tmux` 的持久会话中运行：
 
 ```bash
-RAY_ADDRESS=local
+bash scripts/reproduce.sh --run --allow-api-cost
 ```
 
-这使每个任务启动独立 Ray 实例，避免意外连接另一实验的现有集群（见 [Ray 初始化文档](https://docs.ray.io/en/latest/ray-core/api/doc/ray.init.html)）。仓库自动生成各自唯一的短临时目录；不要对整台服务器执行 `ray stop` 或清理其他任务。并行运行需为每条线分别预留第 8 节的 CPU、内存与磁盘资源；不足时顺序运行，科学配置不变。
+配对控制器保存 `runs/pair/state.json` 和各阶段独立日志；只对自己创建的子进程发送退出信号。SFT 预检使用一次真实 forward/backward/Adam step 的一次性模型，不保存为正式权重。只有正式 SFT 成功退出并核验 step2000 权重、续训状态 SHA，才启动方法 OPSD。任何一条线失败，不继续其后续阶段，另一条线可正常完成；不会盲目重启或重复提交。
 
-基线无需 hint API。方法端填入自己的兼容 API endpoint/key，密钥只放未提交的 `.env`，不打印或写入命令参数。删除 `.env.example` 中未使用的示例凭据，不能把占位值当作真实凭据。
+### 为什么四卡仍是同一 SFT 目标
 
-### 启动两条线
+全局 sampler 先生成原来的八个样本，四个 rank 按位置分配，各两条；没有四个独立 sampler，也不重复采样。每条 loss 乘 `4/8`，DDP 再平均四个 rank 的梯度：
 
-以下代码块分别在对应 clone 的根目录执行。使用调度器或 `tmux` 保持任务独立于 SSH 连接。首次运行先检查 GPU 空闲、资源和依赖；方法端可运行 `bash scripts/train.sh sft --gpu-preflight-only`，验证真实 forward/backward 和优化器显存后再正式启动。该预检不导出训练模型、不替代正式训练。
+```math
+\frac{1}{4}\sum_{r=1}^{4}\sum_{i\in B_r}\frac{4}{8}\nabla L_i
+=\frac{1}{8}\sum_{i=1}^{8}\nabla L_i.
+```
 
-基线终端：
+因此 suffix CE 和独立 BCE 的相对权重不变；梯度裁剪在同步后执行。每 100 步的 256 条 dev、每 500 步的 32 条自由生成也分给四卡执行，按原顺序合并，样本数不乘四。OPSD 的全局 16 任务×8 rollout、PPO mini-batch 256、每卡 micro 32、beta=5 和原生 loss 均不改；框架负责 FSDP 的世界尺寸归一化。多卡的浮点归约、在线采样和负载均衡顺序可能不同，**不声称权重或随机生成结果逐位一致**。
+
+### 中断恢复
+
+先确认旧任务已退出、断点完整、代码/配置未改变：
 
 ```bash
-set -euo pipefail
-mkdir -p runs/launch
-bash scripts/train.sh baseline 2>&1 | tee -a runs/launch/baseline.log
+bash scripts/reproduce.sh --run --allow-api-cost --resume
 ```
 
-方法终端：
+它跳过本控制器已验收完成的阶段，并从完整 SFT/OPSD 保存状态恢复。若发生在 SFT 第一个 500 步保存前，或某目录只写了一半、没有完整指针，控制器会停下要求检查，不冒充可恢复。已经失败的最终导出/评测目录也需先保留证据并处理，不覆盖或自动删除。
+
+单独恢复命令仍可用，但不能与配对控制器同时运行：
 
 ```bash
-set -euo pipefail
-mkdir -p runs/launch
-bash scripts/train.sh sft 2>&1 | tee -a runs/launch/sft.log
-# 只有 SFT 成功退出后才继续；OPSD 入口固定选择 step2000，不是 step4000。
-bash scripts/train.sh opsd --allow-api-cost 2>&1 | tee -a runs/launch/opsd.log
+bash scripts/train.sh sft --resume-latest
+bash scripts/train.sh baseline
+bash scripts/train.sh opsd --allow-api-cost
 ```
 
-`pipefail` 必须保留，防止 SFT 失败却继续启动下一阶段。不要在两个目录各执行一次 `reproduce.sh --run`，否则会重复启动两套完整实验。
+新四卡配置不能直接使用旧单卡实验的 `setup.json` 或续训状态；请使用干净检出和新输出目录，不强行修改原断点绑定。
 
-方法 SFT 保持 10,000 Good / 6,000 Bad、每批 5:3、batch 8、2 epochs / 4,000 steps、后缀 CE + 0.1 marker BCE、不加 SFT KL。两条 OPSD 均为 150 updates、beta=5、每 10 步同一 seen140 验证、每 20 步保存且只保留最近两份完整断点，并保存最终模型。局部 hint 仅由 Actor 的 `<RETHINK>` 触发，Analyzer 不参与路由判断，Student 不见 hint，Teacher 是当前 Actor 的无梯度视角。
+### 最终评测与交付
 
-### 中断恢复与验收
+配对入口自动合并两条线各自 update150 的四份 FSDP 分片，并在该线训练退出后用其第一张卡执行现有 TP1 最终评测；在线训练验证仍使用各自四卡。单卡最终评测不改变已固定的模型、任务、种子或生成预算。八卡分组都用于训练，但 API 等待、存盘及实验先后完成时，不保证八卡始终满负载。
 
-- SFT 中断：先核对最后完整断点与数据/配置绑定，再执行 `bash scripts/train.sh sft --resume-latest`；也可用 `--resume-checkpoint global_step_2000` 指定完整 epoch 断点，两种参数不要同时使用。不能用全新启动覆盖已有输出。
-- OPSD 中断：核对完整保存状态后，在原 clone 重跑原来的 `baseline` 或 `opsd --allow-api-cost` 命令；配置使用 `resume_mode=auto`。日志显示的最新 update 不一定已经保存，恢复应以完整断点为准。
-- 首次启动至少核对初始验证及数次真实更新，确认 rollout、奖励、backward、保存链路正常，不能只凭进程存在宣称训练已跑通。当前公开验证为 CPU 测试，不声称已完成 A100 实跑。
-- 异常先留存日志、资源与断点证据；不自动改 loss、比例、语义、评测任务或触发阈值。必要的工程调整应记录并在两条对照线保持一致。
+评测固定为同一 seen140、同一任务种子、50 步上限、history 2、temperature 0.4、512-token 预算；保留特殊 token，不调用 Analyzer/Teacher。结果分别为：
 
-### 最终第 150 步导出与评测
+- `runs/baseline_seen140/output/summary.json`
+- `runs/opsd_seen140/output/summary.json`
+- `results/tables/seen140.csv`、`results/figures/seen140.png`
 
-等待相应训练退出并释放其 GPU 后，在各自 clone 根目录运行下面命令。基线用 `ARM=baseline`，方法用 `ARM=opsd`：
+如果只单独运行某条线，手动导出/评测：
 
 ```bash
 set -euo pipefail
 set -a
 source .env
 set +a
-ARM=baseline  # 方法目录改成 ARM=opsd
+ARM=baseline  # 方法改为 opsd
 EXPORT="$PWD/checkpoints/${ARM}_hf150"
 PYTHONPATH="$PWD/.deps/sdar" "$OPSD_PYTHON" \
   .deps/sdar/scripts/model_merger.py merge --backend fsdp \
   --local_dir "$PWD/checkpoints/$ARM/checkpoints/global_step_150/actor" \
   --target_dir "$EXPORT"
-bash scripts/eval.sh --model "$EXPORT" --out "runs/${ARM}_seen140" --step 150
+EVAL_GPU=0 bash scripts/eval.sh --model "$EXPORT" --out "runs/${ARM}_seen140" --step 150
 ```
 
-评测必须使用同一 `configs/seen140_tasks.json`：140 个 `valid_seen` 任务、同一任务种子、50 步上限、history 2、temperature 0.4、512-token 生成预算，保留特殊 token；不调用 Analyzer/Teacher。每份结果位于 `runs/<arm>_seen140/output/summary.json`。两份齐全后可在方法目录生成比较图：
-
-```bash
-.venv-sft/bin/python src/tools/plot.py \
-  --baseline ../baseline/runs/baseline_seen140/output/summary.json \
-  --method runs/opsd_seen140/output/summary.json
-```
-
-交付时保留代码 commit、环境版本、解析后的配置、数据/模型 SHA、完整断点、训练与验证日志及任务级评测结果。报告成功数/140、成功率以及实际测得的 reasoning、协议和 RETHINK 统计；RETHINK 触发率是含 marker 的决策步占比，不是 marker 占总 token 的比例。未计算或未完成的指标应标为未测，不补填成绩。
+方法的 `EVAL_GPU` 应改为获配的第一张方法卡，且必须等该卡训练退出。交付代码版本、解析配置、数据/模型 SHA、完整断点、曲线及任务级结果。RETHINK 触发率是含 marker 的**决策步**占比，不是占总 token 的比例。未测指标如实标注；本仓库 CPU/通信测试不等于已完成八卡 A100、NCCL、vLLM 的端到端实测。

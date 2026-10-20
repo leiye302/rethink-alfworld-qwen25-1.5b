@@ -64,7 +64,8 @@ def main():
             ast.parse(path.read_text(encoding='utf-8-sig'), filename=path.name)
     cfg = json.loads((ROOT / 'configs/sft.json').read_text())
     assert (cfg['route_lambda'], cfg['reference_kl_coef']) == (.1, 0)
-    assert (cfg['good_per_batch'], cfg['bad_per_batch'], cfg['total_steps']) == (5, 3, 4000)
+    assert (cfg['good_per_batch'], cfg['bad_per_batch'], cfg['total_steps']) == (5, 3, 2000)
+    assert (cfg['epochs'], cfg['prepared_world_size'], cfg['scheduler_total_steps']) == (1, 4, 4000)
     tasks = json.loads((ROOT / 'configs/seen140_tasks.json').read_text())
     assert len(tasks) == len({t['task_id'] for t in tasks}) == 140
     assert all('/valid_seen/' in t['task_id'] and t['seed'] == 2026+i for i, t in enumerate(tasks))

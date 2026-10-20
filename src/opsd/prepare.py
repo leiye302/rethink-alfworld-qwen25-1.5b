@@ -72,6 +72,7 @@ def main():
     OmegaConf.resolve(cfg)
     OmegaConf.save(cfg,run/'resolved_config.yaml')
     (run/'setup.json').write_text(json.dumps({'baseline':a.baseline,'assets':str(assets),'model':str(model),
+        'recipe_sha256':sha(ROOT/'configs/opsd.yaml'), 'gpus':4,
         'training_games':len(train_games),'evaluation_games':140,'manifest_sha256':sha(ROOT/'configs/seen140_tasks.json')},indent=2))
     print('Prepared inputs and resolved configuration. No GPU/API/training started.')
 

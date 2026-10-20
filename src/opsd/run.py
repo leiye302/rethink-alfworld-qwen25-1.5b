@@ -10,8 +10,21 @@ def main():
     a=p.parse_args()
     if not os.environ.get('CUDA_VISIBLE_DEVICES'):p.error('Set an explicitly allocated CUDA_VISIBLE_DEVICES')
     run=a.run_dir.resolve(); setup=json.loads((run/'setup.json').read_text())
+    sys.path.insert(0,str(ROOT/'src'))
+    from gpu_layout import devices
+    devices(os.environ['CUDA_VISIBLE_DEVICES'],4)
+    import hashlib
+    if setup.get('recipe_sha256') != hashlib.sha256((ROOT/'configs/opsd.yaml').read_bytes()).hexdigest():
+        raise RuntimeError('Saved run uses a different recipe; do not reuse an old single-GPU run')
     from omegaconf import OmegaConf
     cfg=OmegaConf.load(run/'resolved_config.yaml')
+    if (cfg.trainer.n_gpus_per_node, cfg.trainer.nnodes, cfg.ray_init.num_gpus) != (4,1,4):
+        raise RuntimeError('Expected exactly four GPUs in this isolated experiment')
+    import torch
+    if torch.cuda.device_count() != 4:
+        raise RuntimeError('Allocated CUDA devices are not four usable GPUs')
+    cfg.ray_init.address='local'
+    os.environ['RAY_ADDRESS']='local'
     if cfg.algorithm.local_hints.enabled:
         if not a.allow_api_cost:p.error('Method training uses a paid/external hint API; --allow-api-cost is required')
         token=os.environ.get('RETHINK_API_KEY')

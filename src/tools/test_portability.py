@@ -17,6 +17,7 @@ import zipfile
 import package
 import plot
 import setup
+import audit_recipe
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,6 +45,7 @@ class PortabilityTests(unittest.TestCase):
         self.assertEqual({name for name in names if name.startswith('.github/')}, {
             '.github/PULL_REQUEST_TEMPLATE.md', '.github/ISSUE_TEMPLATE/weekly_report.md',
             '.github/ISSUE_TEMPLATE/bug_report.md', '.github/ISSUE_TEMPLATE/experiment_request.md',
+            '.github/workflows/cpu.yml',
         })
 
     def test_public_archive_runs_outside_repository(self):
@@ -72,6 +74,7 @@ class PortabilityTests(unittest.TestCase):
                 ('src/tools/plot.py', ['--help']),
                 ('src/tools/package.py', []), ('src/opsd/api_worker.py', ['--help']),
                 ('src/opsd/prepare.py', ['--help']), ('src/opsd/run.py', ['--help']),
+                ('src/tools/run_pair.py', ['--help']), ('src/tools/audit_recipe.py', []),
                 ('src/evaluation/run_seen140.py', ['--help']),
             ):
                 result = subprocess.run([sys.executable, str(clean / relative), *options], cwd=folder,
@@ -244,6 +247,69 @@ class ResultTests(unittest.TestCase):
             self.assertTrue((destination / 'tables/seen140.csv').is_file())
             self.assertTrue((destination / 'figures/seen140.png').read_bytes().startswith(b'\x89PNG\r\n\x1a\n'))
             self.assertFalse((destination / 'demos').exists())  # no fabricated Demo
+
+
+class MultiGpuContractTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'bash required; exercised in Linux CI')
+    def test_assigned_evaluation_gpu_wins_over_dotenv_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'scripts').mkdir()
+            (root / 'src/evaluation').mkdir(parents=True)
+            shutil.copyfile(ROOT / 'scripts/eval.sh', root / 'scripts/eval.sh')
+            (root / '.env').write_text(
+                'EVAL_GPU=0\nALFWORLD_DATA=unused\nOPSD_PYTHON=bash\n', encoding='utf-8')
+            # The shell fixture replaces the evaluator, not the GPU allocator.
+            (root / 'src/evaluation/run_seen140.py').write_text(
+                'printf "%s" "$CUDA_VISIBLE_DEVICES"\n', encoding='utf-8')
+            result = subprocess.run(['bash', str(root / 'scripts/eval.sh'), '--model', 'unused'],
+                env=dict(os.environ, EVAL_GPU='4'), cwd=directory, capture_output=True,
+                text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, '4')
+
+    def test_recipe_matches_frozen_3b_except_explicit_delta(self):
+        self.assertTrue(audit_recipe.audit()['passed'])
+
+    def test_gpu_allocation_is_four_plus_four_and_rejects_overlap(self):
+        sys.path.insert(0, str(ROOT / 'src'))
+        from gpu_layout import layout
+        self.assertEqual(layout({}), {'baseline': ['0','1','2','3'], 'method': ['4','5','6','7']})
+        with self.assertRaises(ValueError):
+            layout({'BASELINE_GPUS': '0,1,2,3', 'METHOD_GPUS': '3,4,5,6'})
+        with self.assertRaises(ValueError):
+            layout({'METHOD_GPUS': '4,5'})
+        with self.assertRaises(ValueError):
+            layout({'METHOD_GPUS': '4,4,5,6'})
+
+    def test_shared_opsd_math_and_four_rank_microbatch_scaling(self):
+        import yaml
+        current = yaml.safe_load((ROOT / 'configs/opsd.yaml').read_text())
+        old = json.loads((ROOT / 'configs/reference_3b.json').read_text())['opsd']
+        self.assertEqual(current['algorithm'], old['algorithm'])
+        self.assertEqual(current['actor_rollout_ref'], old['actor_rollout_ref'])
+        self.assertEqual(current['data'], old['data'])
+        self.assertEqual(current['env'], old['env'])
+        # SDAR retains its per-microbatch token-mean objective. A 256-row global
+        # mini-batch is 64/rank, 32/micro: two microsteps/rank, not eight/rank.
+        global_batch = current['actor_rollout_ref']['actor']['ppo_mini_batch_size']
+        micro = current['actor_rollout_ref']['actor']['ppo_micro_batch_size_per_gpu']
+        self.assertEqual((global_batch, micro), (256, 32))
+        self.assertEqual(global_batch // 4 // micro, 2)
+        self.assertEqual((1 / 4) / (global_batch // 4 // micro), 1 / (global_batch // micro))
+
+    def test_pair_queues_use_step2000_and_same_final150(self):
+        import run_pair
+        with patch.object(run_pair, 'sft_complete', return_value=False), \
+             patch.object(Path, 'exists', return_value=False):
+            baseline, method = run_pair.commands('baseline'), run_pair.commands('opsd')
+        self.assertEqual([x[0] for x in baseline], ['training','export','evaluation'])
+        self.assertEqual([x[0] for x in method], ['sft_preflight','sft','training','export','evaluation'])
+        self.assertNotIn('--allow-api-cost', baseline[0][1])
+        self.assertIn('--allow-api-cost', method[2][1])
+        for queue in (baseline, method):
+            self.assertIn('global_step_150', ' '.join(queue[-2][1]))
+            self.assertEqual(queue[-1][1][-2:], ['--step', '150'])
 
 
 if __name__ == '__main__':

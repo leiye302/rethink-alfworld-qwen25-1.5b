@@ -1,4 +1,4 @@
-"""Explicitly armed single-80GB-GPU full-parameter Route-SFT entry.
+"""Explicitly armed four-80GB-GPU full-parameter Route-SFT entry.
 
 The legacy sampler, prefix tokenization, AdamW schedule and sample-mean suffix
 objective are retained. A separate full-vocabulary BCE is added. This minimal
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import nullcontext
 import gc
 import hashlib
 import importlib.metadata
@@ -25,6 +26,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
 from .core import batches, encode_row, generation_metrics, load_rows, losses, register_token, sha, write_json
+from . import distributed as parallel
+from torch.nn.parallel import DistributedDataParallel
 
 
 def safe_child(root, relative):
@@ -39,7 +42,7 @@ def check_config(c):
              "global_batch_size": 8, "good_per_batch": 5, "bad_per_batch": 3,
              "micro_batch_size": 1,
              "max_length": 8192, "truncation": "error", "full_parameter_training": True,
-             "lora_rank": 0, "loss_reduction": "sample_mean", "prepared_world_size": 1,
+             "lora_rank": 0, "loss_reduction": "sample_mean", "prepared_world_size": 4,
              "eval_every": 100, "checkpoint_every": 500, "generation_every": 500,
              "generation_assistant_prefix": "", "generation_skip_special_tokens": False,
              "automatic_early_stop": False, "trigger_rate_gate": False, "automatic_opsd": False,
@@ -49,8 +52,10 @@ def check_config(c):
     for k, v in fixed.items():
         if c.get(k) != v:
             raise ValueError("Frozen training contract mismatch: " + k)
-    if c.get("epochs") not in (1, 2) or c.get("total_steps") != 2000 * c["epochs"]:
-        raise ValueError("Each complete epoch must have exactly 2000 updates")
+    if (c.get("epochs"), c.get("total_steps"), c.get("scheduler_total_steps")) != (1, 2000, 4000):
+        raise ValueError("Stop at 2000 while retaining the original 4000-step LR horizon")
+    if c.get("full_resume_checkpoint_steps") != [2000]:
+        raise ValueError("The final step2000 checkpoint must include complete resume state")
 
 
 def training_order(rows, c):
@@ -62,8 +67,8 @@ def training_order(rows, c):
 
 
 def check_resources(c, root, resume=False):
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-        raise RuntimeError("This prepared launcher requires one explicitly assigned GPU")
+    if not torch.cuda.is_available() or torch.cuda.device_count() != c["prepared_world_size"]:
+        raise RuntimeError("This prepared launcher requires four explicitly assigned GPUs")
     if not torch.cuda.is_bf16_supported():
         raise RuntimeError("BF16 support required")
     free, total = torch.cuda.mem_get_info()
@@ -78,7 +83,7 @@ def check_resources(c, root, resume=False):
     meminfo = Path("/proc/meminfo").read_text()
     limits.append(int(re.search(r"MemTotal:\s+(\d+)", meminfo)[1]) * 1024)
     if min(limits) < c["minimum_host_memory_gib"] * 2**30:
-        raise RuntimeError("At least 48GiB container RAM required; 64GiB recommended")
+        raise RuntimeError("At least 96GiB container RAM required for four model replicas")
     minimum_disk_gib = 45 if resume else 100
     if shutil.disk_usage(root).free < minimum_disk_gib * 2**30:
         raise RuntimeError("Insufficient disk headroom for atomic checkpoint and resume-state saving")
@@ -93,26 +98,63 @@ def one_forward(model, encoded, marker_id, c):
     return out
 
 
+def train_batch(model, encoded, indices, marker_id, c, forward=one_forward):
+    """Same eight sample-mean losses, split 2/rank; DDP averages the gradients."""
+    positions = parallel.local_indices(list(range(len(indices))))
+    records = []
+    scale = parallel.backward_scale(c["global_batch_size"])
+    if len(indices) != c["global_batch_size"]:
+        raise ValueError("Unexpected global batch size")
+    for j, position in enumerate(positions):
+        item = encoded[indices[position]]
+        with parallel.accumulation_context(model, j == len(positions) - 1):
+            out = forward(model, item, marker_id, c)
+            if not torch.isfinite(out["loss"]):
+                raise FloatingPointError("Non-finite loss")
+            (out["loss"] * scale).backward()
+        records.append((position, {"route_label": item["route_label"],
+                        **{k: float(v.detach()) for k, v in out.items()}}))
+    return parallel.ordered_records(records)
+
+
+def make_scheduler(optimizer, c):
+    # Stopping the run at 2000 is NOT rescheduling the cosine to end at 2000.
+    horizon = c["scheduler_total_steps"]
+    return get_cosine_schedule_with_warmup(optimizer, int(c["warmup_ratio"] * horizon), horizon)
+
+
+def progress(output, phase, step, total):
+    if parallel.primary():
+        write_json(output / "progress.json",
+                   {"phase": phase, "step": step, "total_steps": total, "time": time.time()})
+
+
 def evaluate(model, encoded, marker_id, c, step, output):
+    model = parallel.unwrap(model)
     was_training = model.training
     model.eval()
     records = []
-    with torch.random.fork_rng(devices=[0]), torch.inference_mode():
-        for item in encoded:
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]), torch.inference_mode():
+        for position in range(parallel.rank(), len(encoded), parallel.world_size()):
+            item = encoded[position]
             out = one_forward(model, item, marker_id, c)
-            records.append({"audit_id": item["audit_id"], "label": item["route_label"],
-                            **{k: float(v) for k, v in out.items()}})
+            records.append((position, {"audit_id": item["audit_id"], "label": item["route_label"],
+                            **{k: float(v) for k, v in out.items()}}))
+    records = parallel.ordered_records(records)
+    assert len(records) == len(encoded)
     model.train(was_training)
     report = {"step": step, "rows": len(records), "teacher_forced": True}
     for group, selected in (("all", records), ("good", [x for x in records if x["label"] == 0]),
                              ("bad", [x for x in records if x["label"] == 1])):
         report[group] = {"n": len(selected), **{k: sum(x[k] for x in selected) / len(selected)
             for k in ("loss", "suffix_ce", "route_bce", "marker_probability", "binary_logit")}}
-    write_json(output / f"eval/step_{step:04d}.json", {"summary": report, "rows": records})
+    if parallel.primary():
+        write_json(output / f"eval/step_{step:04d}.json", {"summary": report, "rows": records})
     return report
 
 
 def generate(model, tokenizer, rows, marker_id, c, step, output):
+    model = parallel.unwrap(model)
     was_training = model.training
     checkpointing = model.is_gradient_checkpointing
     if checkpointing: model.gradient_checkpointing_disable()
@@ -121,8 +163,9 @@ def generate(model, tokenizer, rows, marker_id, c, step, output):
     eos = model.generation_config.eos_token_id
     eos_ids = list(eos) if isinstance(eos, (tuple, list)) else [eos]
     if tokenizer.eos_token_id not in eos_ids: eos_ids.append(tokenizer.eos_token_id)
-    with torch.random.fork_rng(devices=[0]), torch.inference_mode():
-        for row in rows:
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]), torch.inference_mode():
+        for position in range(parallel.rank(), len(rows), parallel.world_size()):
+            row = rows[position]
             # Only H, NEVER a saved R or a forced <think> prefix.
             prompt = tokenizer.apply_chat_template([{"role": "user", "content": row["prompt"]}],
                                                    tokenize=False, add_generation_prompt=True)
@@ -137,8 +180,10 @@ def generate(model, tokenizer, rows, marker_id, c, step, output):
             metrics["length_truncated"] = len(ids) == c["generation_max_new_tokens"] and not metrics["terminated_with_eos"]
             metrics["stored_current_executable"] = metrics["parsed_action"] in row["admissible_actions_before"]
             metrics["oracle_action_equal"] = metrics["parsed_action"] == row["oracle_action"]
-            records.append({"audit_id": row["audit_id"], "source_route": row["route"], "text": text,
-                            "token_ids": ids, **metrics})
+            records.append((position, {"audit_id": row["audit_id"], "source_route": row["route"], "text": text,
+                            "token_ids": ids, **metrics}))
+    records = parallel.ordered_records(records)
+    assert len(records) == len(rows)
     if checkpointing: model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train(was_training)
     keys = ("reasoning_open", "reasoning_closed", "strict_protocol", "marker_present", "length_truncated",
@@ -151,7 +196,8 @@ def generate(model, tokenizer, rows, marker_id, c, step, output):
     for group, selected in (("all", records), ("source_good", [r for r in records if r["source_route"] == "good"]),
                              ("source_bad", [r for r in records if r["source_route"] == "bad"])):
         summary[group] = {"n": len(selected), **{k: sum(r[k] for r in selected) / len(selected) for k in keys}}
-    write_json(output / f"generation/step_{step:04d}.json", {"summary": summary, "rows": records})
+    if parallel.primary():
+        write_json(output / f"generation/step_{step:04d}.json", {"summary": summary, "rows": records})
     return summary
 
 
@@ -159,15 +205,15 @@ def wait_checkpoint_space(model, output):
     # A model plus two Adam moments are written while the preceding state is
     # still valid. Never delete an unverified backup to make room.
     required = sum(p.numel() * p.element_size() for p in model.parameters()) * 3 + 2 * 2**30
-    while shutil.disk_usage(output).free < required:
+    if shutil.disk_usage(output).free < required:
         write_json(output / "progress.json", {"phase": "waiting_for_verified_backup_disk_space",
                    "required_free_bytes": required, "time": time.time()})
         print(json.dumps({"waiting_for_backup_disk_space": True, "required_bytes": required}), flush=True)
-        time.sleep(30)
+        raise RuntimeError("Insufficient atomic-checkpoint space; prior complete checkpoint preserved")
 
 
 def checkpoint(model, tokenizer, optimizer, scheduler, step, output, binding, report, best,
-               *, epoch_end=False, data_position=None):
+               *, epoch_end=False, data_position=None, rank_rng_states=None):
     target = output / f"global_step_{step}"
     temporary = output / f"global_step_{step}.incomplete"
     if target.exists() or temporary.exists():
@@ -180,8 +226,12 @@ def checkpoint(model, tokenizer, optimizer, scheduler, step, output, binding, re
                    if (output / "latest_resume.json").exists() else None)
     state = {"step": step, "binding": binding, "optimizer": optimizer.state_dict(),
              "scheduler": scheduler.state_dict(), "torch_rng": torch.get_rng_state(),
-             "cuda_rng": torch.cuda.get_rng_state_all(), "python_rng": random.getstate(),
+             "cuda_rng": torch.cuda.get_rng_state_all() if parallel.world_size() == 1 else [],
+             "python_rng": random.getstate(),
              "data_position": data_position or {"next_global_batch": step}}
+    if rank_rng_states is not None:
+        state["rank_rng_states"] = rank_rng_states
+        state["world_size"] = len(rank_rng_states)
     # At epoch boundaries the full state is IMMUTABLE inside the checkpoint,
     # so an asynchronous backup cannot race with a rolling-state replacement.
     state_final = temporary / "training_state.pt" if epoch_end else output / f"resume_state_step_{step}.pt"
@@ -225,10 +275,9 @@ def main():
     a = p.parse_args()
     if os.environ.get("ALLOW_ROUTE_SEMANTIC_BCE_TRAINING") != "1":
         raise SystemExit("Preparation only: explicit GPU launch authorization not armed")
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        raise SystemExit("Single-GPU entry; multi-GPU requires a separately verified launcher")
     c = json.loads(a.config.read_text(encoding="utf-8"))
     check_config(c)
+    local_rank = parallel.initialize(c["prepared_world_size"])
     root = a.root.resolve()
     parent, data, output = [safe_child(root, c[k]) for k in ("parent_dir", "data_dir", "output_dir")]
     resuming = a.resume_latest or bool(a.resume_checkpoint)
@@ -251,8 +300,9 @@ def main():
                         for x in sorted(folder.glob("*.py"))},
                "config": c, "no_analyzer_teacher_api": True,
                "versions": {k: importlib.metadata.version(k) for k in ("torch", "transformers", "safetensors")}}
-    if not resuming and not a.gpu_preflight_only:
+    if not resuming and not a.gpu_preflight_only and parallel.primary():
         output.mkdir(parents=True, exist_ok=False)
+    parallel.barrier()
     random.seed(c["seed"])
     torch.manual_seed(c["seed"])
     torch.cuda.manual_seed_all(c["seed"])
@@ -296,7 +346,9 @@ def main():
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     optimizer = torch.optim.AdamW(model.parameters(), lr=c["lr"], betas=tuple(c["betas"]),
                                   weight_decay=c["weight_decay"])
-    scheduler = get_cosine_schedule_with_warmup(optimizer, int(c["warmup_ratio"] * c["total_steps"]), c["total_steps"])
+    scheduler = make_scheduler(optimizer, c)
+    model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank,
+                                    broadcast_buffers=False, gradient_as_bucket_view=True)
     if a.gpu_preflight_only:
         model.train()
         torch.cuda.reset_peak_memory_stats()
@@ -305,56 +357,48 @@ def main():
             selected.extend(sorted((x for x in encoded_train if x["route_label"] == label),
                                    key=lambda x: len(x["input_ids"]), reverse=True)[:count])
         begin = time.monotonic()
-        terms = []
-        for item in selected:
-            out = one_forward(model, item, marker_id, c)
-            if not torch.isfinite(out["loss"]): raise FloatingPointError("GPU preflight loss")
-            (out["loss"] / 8).backward()
-            terms.append({"label": item["route_label"], "tokens": len(item["input_ids"]),
-                          **{k: float(v.detach()) for k, v in out.items()}})
+        terms = train_batch(model, selected, list(range(8)), marker_id, c)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), c["clip_grad"], error_if_nonfinite=True)
         optimizer.step()  # Allocates actual Adam state; this disposable model is NOT saved.
         torch.cuda.synchronize()
-        write_json(root / "reports/gpu_preflight_ep2.json", {"passed": True, "binding": binding,
-            "formal_training_started": False, "disposable_model_not_saved": True, "rows": terms,
-            "grad_norm": float(norm), "seconds": time.monotonic() - begin,
+        devices = parallel.gather({"rank": parallel.rank(), "gpu": torch.cuda.get_device_name(local_rank),
             "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
-            "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30,
-            "gpu": torch.cuda.get_device_name(0)})
-        print("GPU_PREFLIGHT_PASSED_DISPOSABLE_MODEL_NOT_SAVED", flush=True)
+            "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30})
+        if parallel.primary():
+            write_json(root / "reports/gpu_preflight_4gpu.json", {"passed": True, "binding": binding,
+                "formal_training_started": False, "disposable_model_not_saved": True, "rows": terms,
+                "grad_norm": float(norm), "seconds": time.monotonic() - begin, "devices": devices})
+            print("GPU_PREFLIGHT_PASSED_DISPOSABLE_MODEL_NOT_SAVED", flush=True)
         return
     if resume:
         optimizer.load_state_dict(resume["optimizer"])
         scheduler.load_state_dict(resume["scheduler"])
-        torch.set_rng_state(resume["torch_rng"])
-        torch.cuda.set_rng_state_all(resume["cuda_rng"])
-        random.setstate(resume["python_rng"])
+        if resume.get("world_size") != parallel.world_size():
+            raise ValueError("Resume world size differs; do not silently change rank RNG mapping")
+        parallel.restore_rng(resume["rank_rng_states"][parallel.rank()])
         del resume
-    write_json(output / "run_binding.json", {"binding": binding, "marker": token_state,
-               "resume_start_step": start, "training_started": True})
+    if parallel.primary():
+        write_json(output / "run_binding.json", {"binding": binding, "marker": token_state,
+                   "resume_start_step": start, "training_started": True,
+                   "world_size": parallel.world_size(), "local_examples_per_update": 2})
     if start == 0:
-        write_json(output / "progress.json", {"phase": "initial_eval", "step": 0, "total_steps": len(order), "time": time.time()})
+        progress(output, "initial_eval", 0, len(order))
         evaluate(model, encoded_val, marker_id, c, 0, output)
-        write_json(output / "progress.json", {"phase": "initial_generation", "step": 0, "total_steps": len(order), "time": time.time()})
+        progress(output, "initial_generation", 0, len(order))
         generate(model, tokenizer, generation_rows, marker_id, c, 0, output)
     log = output / "metrics.jsonl"
     if resuming:
         # Preserve abandoned post-checkpoint metrics rather than mixing replayed
         # updates into one apparent run. The binding identifies the same recipe.
         log = output / f"metrics_resume_from_{start}_{time.time_ns()}.jsonl"
-    with log.open("x", encoding="utf-8", buffering=1) as stream:
+    with (log.open("x", encoding="utf-8", buffering=1) if parallel.primary() else nullcontext()) as stream:
         for index in range(start, len(order)):
             model.train()
             optimizer.zero_grad(set_to_none=True)
             begin = time.monotonic()
-            terms = []
             lr_used = optimizer.param_groups[0]["lr"]
-            for row_index in order[index]:
-                item = encoded_train[row_index]
-                out = one_forward(model, item, marker_id, c)
-                if not torch.isfinite(out["loss"]): raise FloatingPointError("Non-finite loss")
-                (out["loss"] / 8).backward()
-                terms.append({"route_label": item["route_label"], **{k: float(v.detach()) for k, v in out.items()}})
+            terms = train_batch(model, encoded_train, order[index], marker_id, c)
+            assert Counter(x["route_label"] for x in terms) == {0: 5, 1: 3}
             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), c["clip_grad"], error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
@@ -367,28 +411,43 @@ def main():
             for group, chosen in (("all", terms), ("good", [r for r in terms if r["route_label"] == 0]),
                                    ("bad", [r for r in terms if r["route_label"] == 1])):
                 metric[group] = {k: sum(r[k] for r in chosen) / len(chosen) for k in ("loss", "suffix_ce", "route_bce", "marker_probability")}
-            stream.write(json.dumps(metric) + "\n")
-            print(json.dumps({k: v for k, v in metric.items() if k != "consumed_ids"}), flush=True)
-            write_json(output / "progress.json", {"phase": "training", "step": step, "total_steps": len(order), "time": time.time()})
+            if parallel.primary():
+                stream.write(json.dumps(metric) + "\n")
+                print(json.dumps({k: v for k, v in metric.items() if k != "consumed_ids"}), flush=True)
+            progress(output, "training", step, len(order))
             if step % c["eval_every"] == 0:
-                write_json(output / "progress.json", {"phase": "eval", "step": step, "total_steps": len(order), "time": time.time()})
+                progress(output, "eval", step, len(order))
                 report = evaluate(model, encoded_val, marker_id, c, step, output)
-                print(json.dumps({"eval": report}), flush=True)
+                if parallel.primary():
+                    print(json.dumps({"eval": report}), flush=True)
             if step % c["generation_every"] == 0:
-                write_json(output / "progress.json", {"phase": "generation", "step": step, "total_steps": len(order), "time": time.time()})
-                print(json.dumps({"generation": generate(model, tokenizer, generation_rows, marker_id, c, step, output)}), flush=True)
+                progress(output, "generation", step, len(order))
+                generated = generate(model, tokenizer, generation_rows, marker_id, c, step, output)
+                if parallel.primary():
+                    print(json.dumps({"generation": generated}), flush=True)
             if step % c["checkpoint_every"] == 0:
-                wait_checkpoint_space(model, output)
-                write_json(output / "progress.json", {"phase": "checkpoint", "step": step, "total_steps": len(order), "time": time.time()})
-                best = checkpoint(model, tokenizer, optimizer, scheduler, step, output, binding, report, best,
-                    epoch_end=step % 2000 == 0, data_position={"completed_epochs": step // 2000,
-                    "next_global_batch": step, "next_epoch_index": step // 2000, "next_batch_in_epoch": step % 2000,
-                    "sampler_order_sha256": binding["sampler_order_sha256"]})
+                states = parallel.gather(parallel.rng_state())
+                if parallel.primary():
+                    wait_checkpoint_space(model, output)
+                    progress(output, "checkpoint", step, len(order))
+                    best = checkpoint(parallel.unwrap(model), tokenizer, optimizer, scheduler, step,
+                        output, binding, report, best, rank_rng_states=states,
+                        epoch_end=step % 2000 == 0, data_position={"completed_epochs": step // 2000,
+                        "next_global_batch": step, "next_epoch_index": step // 2000, "next_batch_in_epoch": step % 2000,
+                        "sampler_order_sha256": binding["sampler_order_sha256"]})
+                parallel.barrier()
                 gc.collect()
                 torch.cuda.empty_cache()
-    write_json(output / "completion.json", {"completed": True, "steps": len(order), "binding": binding,
-        "best_saved_checkpoint": best, "training_process_must_still_exit_before_GPU_release_claim": True})
-    write_json(output / "progress.json", {"phase": "completed", "step": len(order), "total_steps": len(order), "time": time.time()})
+    if parallel.primary():
+        write_json(output / "completion.json", {"completed": True, "steps": len(order), "binding": binding,
+            "best_saved_checkpoint": best, "training_process_must_still_exit_before_GPU_release_claim": True})
+    progress(output, "completed", len(order), len(order))
+    parallel.barrier()
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()

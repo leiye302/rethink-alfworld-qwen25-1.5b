@@ -13,8 +13,9 @@
   "good_per_batch": 5,
   "bad_per_batch": 3,
   "micro_batch_size": 1,
-  "epochs": 2,
-  "total_steps": 4000,
+  "epochs": 1,
+  "total_steps": 2000,
+  "scheduler_total_steps": 4000,
   "lr": 2e-06,
   "betas": [
     0.9,
@@ -45,8 +46,7 @@
   "generation_skip_special_tokens": false,
   "checkpoint_every": 500,
   "full_resume_checkpoint_steps": [
-    2000,
-    4000
+    2000
   ],
   "remote_retention": "retain_latest_two_after_verified_archive",
   "local_retention": "user_managed_verified_checkpoint_archive",
@@ -56,7 +56,7 @@
   "trigger_rate_gate": false,
   "automatic_opsd": false,
   "requires_explicit_gpu_launch": true,
-  "prepared_world_size": 1,
+  "prepared_world_size": 4,
   "minimum_gpu_memory_gib": 70,
-  "minimum_host_memory_gib": 48
+  "minimum_host_memory_gib": 96
 }

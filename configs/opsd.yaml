@@ -94,7 +94,7 @@ trainer:
   logger: [console]
   project_name: rethink_public
   experiment_name: route_bce_sdar_hint
-  n_gpus_per_node: 1
+  n_gpus_per_node: 4
   nnodes: 1
   total_epochs: 150
   total_training_steps: 150
@@ -109,6 +109,9 @@ trainer:
   resume_mode: auto
   ray_wait_register_center_timeout: 600
 ray_init:
+  address: local
+  num_gpus: 4
+  include_dashboard: false
   num_cpus: 22
   object_store_memory: 2147483648
   _temp_dir: null

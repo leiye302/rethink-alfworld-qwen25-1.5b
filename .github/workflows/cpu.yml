@@ -1,0 +1,38 @@
+name: CPU recipe and distributed regression
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OMP_NUM_THREADS: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      PYTHONPATH: src/sft
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: configs/requirements-sft.txt
+      - run: |
+          python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r configs/requirements-sft.txt
+      - name: Prepare only public data, dependency source and tokenizer
+        run: |
+          python src/tools/setup.py --bundled-data --framework
+          python -c "import json; from huggingface_hub import snapshot_download; c=json.load(open('configs/sft.json')); snapshot_download(c['base_model'], revision=c['base_revision'], local_dir=c['parent_dir'], allow_patterns=['*.json','*.txt','*.jinja'])"
+      - name: CPU loss, true four-process DDP, resume, portability, recipe audit
+        run: |
+          python -m pytest src/sft/tests -q
+          python -m unittest discover -s src/tools -p 'test_*.py' -v
+          python src/tools/audit_recipe.py --framework
+          python -m route_bce.preflight --data data/route_sft --tokenizer checkpoints/Qwen2.5-1.5B-Instruct --output reports/token_audit.json
+          python src/tools/check.py
+          python src/tools/package.py
+          bash -n scripts/train.sh scripts/eval.sh scripts/reproduce.sh

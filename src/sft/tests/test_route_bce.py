@@ -12,7 +12,7 @@ from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
 
 from legacy.stage1_training import masked_sft_loss
 from route_bce.core import batches, encode_row, generation_metrics, load_rows, losses, register_token
-from route_bce.train import check_config, checkpoint, safe_child, training_order
+from route_bce.train import check_config, checkpoint, make_scheduler, safe_child, training_order
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -186,19 +186,31 @@ def test_launch_config_and_safe_paths(tmp_path):
     with pytest.raises(ValueError): safe_child(tmp_path, "../other_project")
 
 
-def test_two_epochs_exact_coverage_and_frozen_recipe():
+def test_first_epoch_exact_coverage_and_frozen_recipe():
     c = json.loads((ROOT / "configs/sft.json").read_text())
     check_config(c)
     rows = [{"route": "good"}] * 10000 + [{"route": "bad"}] * 6000
     order = training_order(rows, c)
-    assert len(order) == 4000
-    assert order[:2000] == batches(rows, epoch=0)
-    assert order[2000:] == batches(rows, epoch=1)
-    assert order[:2000] != order[2000:]
-    for portion in (order[:2000], order[2000:]):
-        assert sorted(i for group in portion for i in group) == list(range(16000))
-        assert all(sum(rows[i]["route"] == "good" for i in group) == 5 for group in portion)
-    c["total_steps"] = 2000
+    assert len(order) == 2000
+    assert order == batches(rows, epoch=0)
+    assert sorted(i for group in order for i in group) == list(range(16000))
+    assert all(sum(rows[i]["route"] == "good" for i in group) == 5 for group in order)
+    c["total_steps"] = 4000
+    with pytest.raises(ValueError): check_config(c)
+
+
+def test_stop2000_preserves_legacy_first2000_learning_rates():
+    from transformers import get_cosine_schedule_with_warmup
+    c = json.loads((ROOT / "configs/sft.json").read_text())
+    a, b = [torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))], lr=c["lr"]) for _ in range(2)]
+    current = make_scheduler(a, c)
+    legacy = get_cosine_schedule_with_warmup(b, 400, 4000)
+    for _ in range(2000):
+        assert a.param_groups[0]["lr"] == b.param_groups[0]["lr"]
+        a.step(); b.step(); current.step(); legacy.step()
+    assert current.get_last_lr() == legacy.get_last_lr()
+    assert current.get_last_lr()[0] > 0
+    c["scheduler_total_steps"] = 2000
     with pytest.raises(ValueError): check_config(c)
 
 

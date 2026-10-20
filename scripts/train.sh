@@ -4,14 +4,20 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 if [[ $# -eq 0 || "$1" == "--help" ]]; then
   echo 'Usage: bash scripts/train.sh {sft|opsd|baseline} [options]'
+  echo 'Four GPUs per arm: BASELINE_GPUS=0,1,2,3 and METHOD_GPUS=4,5,6,7.'
   echo 'OPSD requires --allow-api-cost. SFT forwards resume/preflight options.'
   exit 0
 fi
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 STAGE=$1; shift
-: "${CUDA_VISIBLE_DEVICES:?Explicitly set your allocated GPU}"
+PY=${OPSD_PYTHON:-python}
+if [[ "$STAGE" == sft ]]; then PY=${SFT_PYTHON:-python}; fi
+CUDA_VISIBLE_DEVICES=$("$PY" src/gpu_layout.py --stage "$STAGE")
+export CUDA_VISIBLE_DEVICES
+export RAY_ADDRESS=local
 export TOKENIZERS_PARALLELISM=false
 if [[ "$STAGE" == sft ]]; then
+  unset RETHINK_API_KEY
   PY=${SFT_PYTHON:-python}
   export PYTHONPATH="$ROOT/src/sft"
   export HF_HUB_OFFLINE=1
@@ -19,7 +25,8 @@ if [[ "$STAGE" == sft ]]; then
     --tokenizer "$ROOT/checkpoints/Qwen2.5-1.5B-Instruct" \
     --output "$ROOT/reports/cpu_token_preflight_remote.json"
   export ALLOW_ROUTE_SEMANTIC_BCE_TRAINING=1
-  exec "$PY" -m route_bce.train --root "$ROOT" --config "$ROOT/configs/sft.json" "$@"
+  exec "$PY" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=4 \
+    --max-restarts=0 --module route_bce.train --root "$ROOT" --config "$ROOT/configs/sft.json" "$@"
 elif [[ "$STAGE" == opsd || "$STAGE" == baseline ]]; then
   : "${ALFWORLD_DATA:?Set the ALFWorld asset directory}"
   PY=${OPSD_PYTHON:-python}
@@ -30,6 +37,7 @@ elif [[ "$STAGE" == opsd || "$STAGE" == baseline ]]; then
   MODEL="$ROOT/checkpoints/route_sft/global_step_2000"
   EXTRA=()
   if [[ "$STAGE" == baseline ]]; then
+    unset RETHINK_API_KEY
     MODEL="$ROOT/checkpoints/Qwen2.5-1.5B-Instruct"; EXTRA=(--baseline)
   fi
   if [[ ! -f "$RUN/setup.json" ]]; then
