@@ -1,0 +1,42 @@
+name: rethink-alfworld-qwen25-1.5b
+
+owner: ~
+
+start_date: ~ # 待确认
+
+stage: baseline
+# idea / baseline / improving / writing / finished
+
+topic:
+  - Agent Reinforcement Learning
+  - On-Policy Self-Distillation
+
+goal: >
+  让 Agent 自主识别不可靠的推理并触发 RETHINK，通过训练期局部提示学习纠错，提升任务完成能力。
+
+baseline:
+  name: GRPO + OPSD (SDAR, beta=5)
+  reproduced: false
+  backbone: Qwen/Qwen2.5-1.5B-Instruct
+
+novelty: >
+  用 Route-SFT 学习自主 RETHINK 触发，并在 GRPO + OPSD 中仅为触发步骤提供 Teacher 侧局部 hint，推理时不依赖外部 Analyzer。
+
+dataset:
+  - ALFWorld valid_seen140
+
+metric:
+  - success_rate_percent
+
+best_result: ~
+
+risk:
+  - RETHINK 触发准确性与 reasoning 保留需要持续验证。
+  - 本版本尚未进行正式 GPU 训练或报告 1.5B 成绩。
+
+next_milestone: >
+  复用冻结 3B SFT 数据与配方，完成同家族 1.5B 的训练及 seen140 评测。
+
+paper_target: [] # 待确认
+
+last_update: 2026-10-20
