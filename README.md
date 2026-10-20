@@ -85,7 +85,7 @@ python3.10 -m venv .venv-sft
 .venv-sft/bin/pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 .venv-sft/bin/pip install -r configs/requirements-sft.txt
 
-python src/tools/setup.py --framework
+.venv-sft/bin/python src/tools/setup.py --framework
 python3.12 -m venv .venv-opsd
 .venv-opsd/bin/pip install --upgrade pip setuptools wheel packaging ninja
 .venv-opsd/bin/pip install -r configs/requirements-opsd.txt
@@ -95,7 +95,7 @@ python3.12 -m venv .venv-opsd
 
 cp .env.example .env
 # 删除 .env 中未使用的 HF_TOKEN / WANDB_API_KEY 示例值，或换成自己的值。
-python src/tools/setup.py --bundled-data
+.venv-sft/bin/python src/tools/setup.py --bundled-data
 .venv-sft/bin/python src/tools/setup.py --download-base --accept-model-license
 ```
 
@@ -133,7 +133,7 @@ bash scripts/reproduce.sh --run --allow-api-cost
 bash scripts/train.sh sft
 bash scripts/train.sh opsd --allow-api-cost
 bash scripts/train.sh baseline
-bash scripts/eval.sh --model /path/to/exported-hf-model --out runs/seen140
+bash scripts/eval.sh --model /path/to/exported-hf-model --out runs/seen140 --step 150
 ```
 
 **只跑基线**：准备 OPSD 环境、公开基模和 ALFWorld 游戏资源后，直接执行 `bash scripts/train.sh baseline`，不需要先跑 SFT，也不需要 hint API 账号或 `--allow-api-cost`。不要执行 `reproduce.sh --run`，后者会顺序运行两条完整实验线。单独评测使用导出的 Hugging Face 模型目录，固定任务集无需作者的外部文件。
@@ -147,3 +147,92 @@ Ray 临时 socket/log 目录使用系统临时目录，位置记录在本次运�
 评测固定为 seen140、相同任务与种子、最多 50 步、history 2、temperature 0.4、最大生成长度 512；保留特殊 token 以统计 `<RETHINK>`。完整配置见 [configs/eval.json](configs/eval.json)。
 
 代码基于 [SDAR](https://github.com/ZJU-REAL/SDAR)，固定版本见 [configs/upstream.json](configs/upstream.json)。新增代码采用 [Apache-2.0](LICENSE)，保留上游文件许可；[Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) 权重采用 Apache-2.0，ALFWorld 资源及由其构造的任务内容仍遵循来源许可。模型权重和 ALFWorld 游戏资源不重复上传。
+
+## 9. 8×A100 80GB 服务器：基线与方法独立运行
+
+**现有入口是单卡配方，不是八卡 DDP。** 在八卡服务器上，先分配两张空闲 A100 80GB：一张跑基线，另一张依次跑 Route-SFT 与方法 OPSD。其余卡不必占用。不要直接套 `torchrun --nproc_per_node=8`，也不要因卡多而改变全局 batch、采样量、loss 归一化或更新数。SFT 当前资源检查要求单卡总显存至少 70 GiB、空闲至少 65 GiB；本节不适用于 A100 40GB。
+
+### 两个独立工作目录
+
+在自己有权限的服务器目录中准备两个 clone，并锁定同一 commit：
+
+```bash
+git clone https://github.com/leiye302/rethink-alfworld-qwen25-1.5b.git baseline
+COMMIT=$(git -C baseline rev-parse HEAD)
+git clone https://github.com/leiye302/rethink-alfworld-qwen25-1.5b.git method
+git -C method checkout --detach "$COMMIT"
+git -C baseline checkout --detach "$COMMIT"
+```
+
+两个目录分别完成第 8 节的环境、公开模型与 ALFWorld 资源准备，以及 `bash scripts/reproduce.sh --check`。冻结 SFT 数据已经随仓库上传，方法端执行 `setup.py --bundled-data` 即可校验解包，不需要作者电脑或任何旧服务器。ALFWorld 游戏资源可共用一份只读目录，训练输出、断点、日志和 API 缓存不得共用。
+
+分别编辑各自的 `.env`：基线设置 `CUDA_VISIBLE_DEVICES=0`，方法设置 `CUDA_VISIBLE_DEVICES=1`，编号以实际获配的空闲卡为准。**启动脚本会读取 `.env`；不要只在命令前改 GPU 环境变量而漏改 `.env`。** 两个目录均补充：
+
+```bash
+RAY_ADDRESS=local
+```
+
+这使每个任务启动独立 Ray 实例，避免意外连接另一实验的现有集群（见 [Ray 初始化文档](https://docs.ray.io/en/latest/ray-core/api/doc/ray.init.html)）。仓库自动生成各自唯一的短临时目录；不要对整台服务器执行 `ray stop` 或清理其他任务。并行运行需为每条线分别预留第 8 节的 CPU、内存与磁盘资源；不足时顺序运行，科学配置不变。
+
+基线无需 hint API。方法端填入自己的兼容 API endpoint/key，密钥只放未提交的 `.env`，不打印或写入命令参数。删除 `.env.example` 中未使用的示例凭据，不能把占位值当作真实凭据。
+
+### 启动两条线
+
+以下代码块分别在对应 clone 的根目录执行。使用调度器或 `tmux` 保持任务独立于 SSH 连接。首次运行先检查 GPU 空闲、资源和依赖；方法端可运行 `bash scripts/train.sh sft --gpu-preflight-only`，验证真实 forward/backward 和优化器显存后再正式启动。该预检不导出训练模型、不替代正式训练。
+
+基线终端：
+
+```bash
+set -euo pipefail
+mkdir -p runs/launch
+bash scripts/train.sh baseline 2>&1 | tee -a runs/launch/baseline.log
+```
+
+方法终端：
+
+```bash
+set -euo pipefail
+mkdir -p runs/launch
+bash scripts/train.sh sft 2>&1 | tee -a runs/launch/sft.log
+# 只有 SFT 成功退出后才继续；OPSD 入口固定选择 step2000，不是 step4000。
+bash scripts/train.sh opsd --allow-api-cost 2>&1 | tee -a runs/launch/opsd.log
+```
+
+`pipefail` 必须保留，防止 SFT 失败却继续启动下一阶段。不要在两个目录各执行一次 `reproduce.sh --run`，否则会重复启动两套完整实验。
+
+方法 SFT 保持 10,000 Good / 6,000 Bad、每批 5:3、batch 8、2 epochs / 4,000 steps、后缀 CE + 0.1 marker BCE、不加 SFT KL。两条 OPSD 均为 150 updates、beta=5、每 10 步同一 seen140 验证、每 20 步保存且只保留最近两份完整断点，并保存最终模型。局部 hint 仅由 Actor 的 `<RETHINK>` 触发，Analyzer 不参与路由判断，Student 不见 hint，Teacher 是当前 Actor 的无梯度视角。
+
+### 中断恢复与验收
+
+- SFT 中断：先核对最后完整断点与数据/配置绑定，再执行 `bash scripts/train.sh sft --resume-latest`；也可用 `--resume-checkpoint global_step_2000` 指定完整 epoch 断点，两种参数不要同时使用。不能用全新启动覆盖已有输出。
+- OPSD 中断：核对完整保存状态后，在原 clone 重跑原来的 `baseline` 或 `opsd --allow-api-cost` 命令；配置使用 `resume_mode=auto`。日志显示的最新 update 不一定已经保存，恢复应以完整断点为准。
+- 首次启动至少核对初始验证及数次真实更新，确认 rollout、奖励、backward、保存链路正常，不能只凭进程存在宣称训练已跑通。当前公开验证为 CPU 测试，不声称已完成 A100 实跑。
+- 异常先留存日志、资源与断点证据；不自动改 loss、比例、语义、评测任务或触发阈值。必要的工程调整应记录并在两条对照线保持一致。
+
+### 最终第 150 步导出与评测
+
+等待相应训练退出并释放其 GPU 后，在各自 clone 根目录运行下面命令。基线用 `ARM=baseline`，方法用 `ARM=opsd`：
+
+```bash
+set -euo pipefail
+set -a
+source .env
+set +a
+ARM=baseline  # 方法目录改成 ARM=opsd
+EXPORT="$PWD/checkpoints/${ARM}_hf150"
+PYTHONPATH="$PWD/.deps/sdar" "$OPSD_PYTHON" \
+  .deps/sdar/scripts/model_merger.py merge --backend fsdp \
+  --local_dir "$PWD/checkpoints/$ARM/checkpoints/global_step_150/actor" \
+  --target_dir "$EXPORT"
+bash scripts/eval.sh --model "$EXPORT" --out "runs/${ARM}_seen140" --step 150
+```
+
+评测必须使用同一 `configs/seen140_tasks.json`：140 个 `valid_seen` 任务、同一任务种子、50 步上限、history 2、temperature 0.4、512-token 生成预算，保留特殊 token；不调用 Analyzer/Teacher。每份结果位于 `runs/<arm>_seen140/output/summary.json`。两份齐全后可在方法目录生成比较图：
+
+```bash
+.venv-sft/bin/python src/tools/plot.py \
+  --baseline ../baseline/runs/baseline_seen140/output/summary.json \
+  --method runs/opsd_seen140/output/summary.json
+```
+
+交付时保留代码 commit、环境版本、解析后的配置、数据/模型 SHA、完整断点、训练与验证日志及任务级评测结果。报告成功数/140、成功率以及实际测得的 reasoning、协议和 RETHINK 统计；RETHINK 触发率是含 marker 的决策步占比，不是 marker 占总 token 的比例。未计算或未完成的指标应标为未测，不补填成绩。
